@@ -8,13 +8,53 @@ Indian Automatic License Plate Recognition (ALPR/ANPR) system. The goal is to de
 
 ## Environment
 
-Python 3.14 virtual environment at `alpr-env/`. Activate with:
+The pipeline targets **Python 3.12** (TensorFlow has no 3.14 wheel). The committed
+`alpr-env/` was created with 3.14 and must be recreated:
 
 ```bash
+rm -rf alpr-env
+python3.12 -m venv alpr-env
 source alpr-env/bin/activate
+pip install -r requirements.txt
 ```
 
-No ML packages are installed yet — install as needed (e.g., `pip install opencv-python torch ultralytics`).
+The whole stack is **TensorFlow/Keras 3 + OpenCV** — no PyTorch/YOLO. Detection is
+done as bbox regression with a MobileNetV2 backbone, not an object detector.
+
+## Architecture
+
+Three modular stages, orchestrated end-to-end by `src/pipeline.py::ALPRPipeline`:
+
+1. **Detection** (`src/detection.py`) — MobileNetV2 → Dense(4, sigmoid) regresses one
+   normalized `[xmin,ymin,xmax,ymax]` box. Loss = Huber + (1−GIoU); metric = mean IoU.
+   One plate per image, so a single box suffices.
+2. **Preprocessing** (`src/preprocessing.py`) — `preprocess_plate()`: expand+crop the box,
+   recover plate corners (Canny→contours→approxPolyDP), 4-point perspective warp (falls back
+   to plain resize), grayscale, CLAHE → `(64, 256)` uint8.
+3. **OCR** (`src/ocr.py`) — CRNN: 4-block CNN (width axis becomes `T=32` time steps) →
+   2× BiLSTM → Dense logits `(B, 32, 37)`. Trained with built-in `keras.losses.CTC`;
+   decoded with `keras.ops.ctc_decode`. **The Dense output is linear logits, not softmax**
+   (CTC loss/decode apply softmax internally). Charset = 36 chars + blank at index 0.
+
+`src/data.py` is the shared data layer: `parse_voc` (filters noise via the two plate regexes,
+skips Zone.Identifier and degenerate boxes), `deduplicate` (video frames → one per plate, largest
+box), `plate_aware_split` (groups by plate text so no plate leaks across train/val/test),
+`build_detection_manifest` (CSV of normalized boxes + plate_text), `build_ocr_dataset` (cropped
+grayscale plates + `labels.csv`).
+
+## Commands
+
+```bash
+python scripts/prepare_data.py                 # parse → dedup → split → build datasets (prints counts)
+python scripts/train_detection.py              # train detector → models/detection/detector.keras
+python scripts/train_ocr.py                    # train CRNN → models/ocr/crnn_best.keras
+python scripts/evaluate.py --stage detection   # mean IoU + acc@IoU>=0.5
+python scripts/evaluate.py --stage ocr         # exact-match + CER on cropped plates
+python scripts/evaluate.py --stage pipeline    # end-to-end exact-match on predicted boxes + per-state
+pytest tests/                                  # offline unit tests (parse/preprocess/ctc)
+```
+
+Generated `datasets/` and `models/` are git-ignored.
 
 ## Data Structure
 

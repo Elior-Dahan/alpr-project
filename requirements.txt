@@ -1,0 +1,20 @@
+# Indian ALPR System — Python 3.12
+
+# Detection + OCR (Keras 3 on TensorFlow backend)
+tensorflow>=2.16
+keras>=3.3
+
+# Imaging
+opencv-python>=4.9
+Pillow>=10.3
+numpy>=1.26
+
+# Data pipeline
+pandas>=2.2
+scikit-learn>=1.4
+tqdm>=4.66
+
+# Evaluation / dev
+python-Levenshtein>=0.25
+matplotlib>=3.8
+pytest>=8.2
