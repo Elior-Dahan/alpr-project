@@ -54,7 +54,12 @@ python scripts/evaluate.py --stage pipeline    # end-to-end exact-match on predi
 pytest tests/                                  # offline unit tests (parse/preprocess/ctc)
 ```
 
-Generated `datasets/` and `models/` are git-ignored.
+`alpr_pipeline.ipynb` (repo root) is a report-style notebook that runs the whole
+pipeline as an alternative to the CLI — hybrid style: it imports utilities from
+`src/` but inlines `build_detector`/`build_crnn` for visibility. It trains with
+small default epochs or loads saved models if present. Notebook tooling lives in
+`requirements-dev.txt` (`jupyter`/`nbconvert`). Generated `datasets/` and `models/`
+are git-ignored.
 
 ## Data Structure
 

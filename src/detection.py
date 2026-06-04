@@ -41,7 +41,15 @@ def build_detector(input_size: int = INPUT_SIZE) -> keras.Model:
 # --- Loss & metric --------------------------------------------------------
 
 def _box_iou_components(y_true, y_pred):
-    """Return (intersection, union, enclosing-area) for batched xyxy boxes."""
+    """Return (intersection, union, enclosing-area) for batched xyxy boxes.
+
+    Shared by both ``giou_loss`` and the ``MeanIoU`` metric. Boxes are
+    ``[xmin, ymin, xmax, ymax]``; the intersection is the overlap rectangle
+    (clamped to >= 0), and ``enclose`` is the area of the smallest axis-aligned
+    box containing both — the extra term GIoU needs to penalise non-overlapping
+    predictions (plain IoU is 0 and gives no gradient when boxes are disjoint).
+    """
+    # Intersection rectangle: max of the mins, min of the maxes.
     x0 = tf.maximum(y_true[:, 0], y_pred[:, 0])
     y0 = tf.maximum(y_true[:, 1], y_pred[:, 1])
     x1 = tf.minimum(y_true[:, 2], y_pred[:, 2])
@@ -66,7 +74,12 @@ def _box_iou_components(y_true, y_pred):
 
 
 def giou_loss(y_true, y_pred):
-    """1 - GIoU, averaged over the batch."""
+    """1 - GIoU, averaged over the batch (lower is better, range [0, 2]).
+
+    GIoU = IoU - (area_enclosing - area_union) / area_enclosing. The second term
+    shrinks as the prediction moves toward the target even while they don't yet
+    overlap, so the loss keeps a useful gradient where IoU alone would be flat.
+    """
     eps = 1e-7
     inter, union, enclose = _box_iou_components(y_true, y_pred)
     iou = inter / (union + eps)
@@ -75,13 +88,22 @@ def giou_loss(y_true, y_pred):
 
 
 def detector_loss(y_true, y_pred):
-    """Huber on the 4 coords + (1 - GIoU)."""
+    """Combined box loss: Huber on the 4 coordinates + (1 - GIoU).
+
+    Huber gives a stable per-coordinate gradient; GIoU adds an overlap-aware
+    term so the box is optimised as a whole rectangle, not four independent
+    numbers.
+    """
     huber = keras.losses.Huber()(y_true, y_pred)
     return huber + giou_loss(y_true, y_pred)
 
 
 class MeanIoU(keras.metrics.Metric):
-    """Mean IoU over predicted vs. ground-truth boxes (normalized xyxy)."""
+    """Streaming mean IoU over predicted vs. ground-truth boxes (normalized xyxy).
+
+    Accumulates the IoU sum and sample count across batches so ``result()``
+    reports the epoch-wide average rather than a single batch's value.
+    """
 
     def __init__(self, name: str = "mean_iou", **kwargs):
         super().__init__(name=name, **kwargs)
@@ -125,6 +147,13 @@ def _load_manifest(csv_path: str | Path):
 
 
 def _decode_and_resize(path, box, augment):
+    """Load and resize one image to the network input, returning (image, box).
+
+    The target ``box`` is already normalized to [0, 1] in the manifest, so it
+    needs no adjustment when the image is resized. Augmentation is photometric
+    only (brightness/contrast) — no geometric flips, which would invalidate the
+    box and orient plates unnaturally.
+    """
     raw = tf.io.read_file(path)
     img = tf.io.decode_image(raw, channels=3, expand_animations=False)
     img = tf.image.resize(img, (INPUT_SIZE, INPUT_SIZE))
@@ -133,7 +162,8 @@ def _decode_and_resize(path, box, augment):
         img = tf.image.random_brightness(img, 0.1)
         img = tf.image.random_contrast(img, 0.9, 1.1)
         img = tf.clip_by_value(img, 0.0, 255.0)
-    img = preprocess_input(img)  # scales to [-1, 1]
+    # MobileNetV2 expects inputs scaled to [-1, 1], not [0, 255] or [0, 1].
+    img = preprocess_input(img)
     return img, box
 
 
@@ -154,44 +184,102 @@ def make_dataset(
 
 # --- Training -------------------------------------------------------------
 
+# Two-phase schedule. Adding GIoU from a cold start produces noisy gradients
+# while boxes don't yet overlap, which can saturate the output sigmoid into an
+# inverted box (xmax < xmin) where GIoU's clamps *and* Huber's saturated sigmoid
+# both kill the gradient — the model collapses (mean_iou stuck at 0). So we warm
+# up with Huber alone until boxes overlap, then fine-tune with Huber + GIoU at a
+# lower LR. Tune these knobs freely.
+WARMUP_EPOCHS = 8
+WARMUP_LR = 1e-4
+# Phase 2 is a max budget — EarlyStopping (patience 5 on val mean IoU) stops it
+# once IoU plateaus, so this is an upper bound rather than a fixed count.
+FINETUNE_EPOCHS = 50
+FINETUNE_LR = 3e-5
+
+
+def _checkpoint(model_out: Path) -> keras.callbacks.ModelCheckpoint:
+    """Save the best model by validation mean IoU (shared across both phases)."""
+    return keras.callbacks.ModelCheckpoint(
+        str(model_out), save_best_only=True, monitor="val_mean_iou", mode="max"
+    )
+
+
 def train(
     detection_dir: str | Path = "datasets/detection",
     model_out: str | Path = "models/detection/detector.keras",
-    epochs: int = 100,
     batch_size: int = 16,
-    lr: float = 1e-3,
+    warmup_epochs: int = WARMUP_EPOCHS,
+    warmup_lr: float = WARMUP_LR,
+    finetune_epochs: int = FINETUNE_EPOCHS,
+    finetune_lr: float = FINETUNE_LR,
 ) -> keras.Model:
-    """Fine-tune the detector; save the best checkpoint by val mean IoU."""
+    """Train the detector in two phases; save the best checkpoint by val mean IoU.
+
+    Phase 1 warms up with Huber only (stable box regression); Phase 2 re-compiles
+    the *same* model with the full Huber + GIoU loss to refine localisation. See
+    the module-level note for why the warmup is necessary.
+
+    Raises ``RuntimeError`` if the warmup fails to produce a non-zero mean IoU
+    within the first epoch — a sign the data/manifest is wrong, so we stop rather
+    than proceed into the GIoU phase.
+    """
     detection_dir = Path(detection_dir)
     model_out = Path(model_out)
     model_out.parent.mkdir(parents=True, exist_ok=True)
 
+    # Augmentation is intentionally off for now (added deliberately later).
     train_ds = make_dataset(
-        detection_dir / "train.csv", batch_size, augment=True, shuffle=True
+        detection_dir / "train.csv", batch_size, augment=False, shuffle=True
     )
     val_ds = make_dataset(detection_dir / "val.csv", batch_size)
 
     model = build_detector()
+
+    # Phase 1 — Huber warmup.
+    print(f"[detector] Phase 1: Huber warmup — {warmup_epochs} epochs @ lr={warmup_lr}")
     model.compile(
-        optimizer=keras.optimizers.Adam(lr),
+        optimizer=keras.optimizers.Adam(warmup_lr),
+        loss=keras.losses.Huber(),
+        metrics=[MeanIoU()],
+    )
+    hist = model.fit(
+        train_ds, validation_data=val_ds,
+        epochs=warmup_epochs, callbacks=[_checkpoint(model_out)],
+    )
+
+    # Gate: stable regression should yield a non-zero IoU within one epoch.
+    first_iou = hist.history["mean_iou"][0]
+    if not first_iou > 0:
+        raise RuntimeError(
+            f"Warmup failed: mean_iou={first_iou} after epoch 1 (expected > 0). "
+            "Stopping before the GIoU phase — investigate the data/manifest."
+        )
+
+    # Phase 2 — Huber + GIoU fine-tune. EarlyStopping (not a fixed count) ends
+    # this phase once val mean IoU plateaus, restoring the best weights.
+    print(
+        f"[detector] Phase 2: Huber+GIoU fine-tune — up to {finetune_epochs} epochs @ lr={finetune_lr}"
+    )
+    model.compile(
+        optimizer=keras.optimizers.Adam(finetune_lr),
         loss=detector_loss,
         metrics=[MeanIoU()],
     )
-    callbacks = [
-        keras.callbacks.ModelCheckpoint(
-            str(model_out),
-            save_best_only=True,
-            monitor="val_mean_iou",
-            mode="max",
-        ),
-        keras.callbacks.ReduceLROnPlateau(
-            monitor="val_mean_iou", mode="max", factor=0.5, patience=5
-        ),
-        keras.callbacks.EarlyStopping(
-            monitor="val_mean_iou", mode="max", patience=15, restore_best_weights=True
-        ),
-    ]
-    model.fit(train_ds, validation_data=val_ds, epochs=epochs, callbacks=callbacks)
+    model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=finetune_epochs,
+        callbacks=[
+            _checkpoint(model_out),
+            keras.callbacks.EarlyStopping(
+                monitor="val_mean_iou",
+                mode="max",
+                patience=5,
+                restore_best_weights=True,
+            ),
+        ],
+    )
     return model
 
 

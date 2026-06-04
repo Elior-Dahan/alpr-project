@@ -33,7 +33,12 @@ TIME_STEPS = 32  # CNN reduces width 256 -> 32 (>= 2 * max label length)
 
 
 def encode_label(text: str) -> list[int]:
-    """Map a plate string to integer indices (1..36), padded with 0 to MAX_LABEL_LEN."""
+    """Map a plate string to integer indices (1..36), padded with 0 to MAX_LABEL_LEN.
+
+    Index 0 is the CTC blank and doubles as the padding/mask value, so a padded
+    label like ``[11, 12, 4, 5, 0, 0, ...]`` ("KL45") is unambiguous: the loss
+    treats the trailing zeros as "no character here" rather than real classes.
+    """
     idxs = [CHAR_TO_IDX[c] for c in text if c in CHAR_TO_IDX]
     idxs = idxs[:MAX_LABEL_LEN]
     return idxs + [BLANK_INDEX] * (MAX_LABEL_LEN - len(idxs))
@@ -42,13 +47,20 @@ def encode_label(text: str) -> list[int]:
 # --- Model ----------------------------------------------------------------
 
 def build_crnn() -> keras.Model:
-    """4-block CNN -> BiLSTM x2 -> Dense softmax. Output (B, TIME_STEPS, NUM_CLASSES)."""
+    """CRNN: 4-block CNN -> 2x BiLSTM -> Dense logits. Output (B, TIME_STEPS, NUM_CLASSES).
+
+    The CNN turns the image into a horizontal sequence of feature vectors (one
+    per output column), which the BiLSTMs read left-to-right and right-to-left
+    before the Dense layer scores each timestep over the 37 classes. CTC then
+    aligns this length-32 sequence to the variable-length plate text.
+    """
     inputs = keras.Input(shape=(OCR_HEIGHT, OCR_WIDTH, 1), name="image")
 
     x = inputs
-    # Pools: first three halve both H and W, the last halves only H.
-    # H: 64 -> 32 -> 16 -> 8 -> 4   (/16)
-    # W: 256 -> 128 -> 64 -> 32 -> 32 (/8)
+    # Each block halves H; only the first three also halve W. The asymmetric
+    # last pool keeps the width (time) axis long enough for CTC:
+    #   H: 64 -> 32 -> 16 -> 8 -> 4    (/16)
+    #   W: 256 -> 128 -> 64 -> 32 -> 32 (/8, so TIME_STEPS = 32)
     pool_sizes = [(2, 2), (2, 2), (2, 2), (2, 1)]
     filters = [64, 128, 256, 256]
     for f, pool in zip(filters, pool_sizes):
@@ -57,7 +69,9 @@ def build_crnn() -> keras.Model:
         x = layers.Activation("relu")(x)
         x = layers.MaxPooling2D(pool)(x)
 
-    # x: (B, H'=4, W'=32, C=256). Width is the time axis.
+    # x: (B, H'=4, W'=32, C=256). Move width to the front so it becomes the time
+    # axis, then fold the remaining height and channels into one feature vector
+    # per timestep: (B, 32, 4*256=1024).
     x = layers.Permute((2, 1, 3))(x)  # (B, 32, 4, 256)
     x = layers.Reshape((TIME_STEPS, -1))(x)  # (B, 32, 1024)
 

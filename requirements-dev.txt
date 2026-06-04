@@ -1,0 +1,6 @@
+# Dev/notebook extras (not needed to run the pipeline itself).
+-r requirements.txt
+
+jupyter>=1.0
+nbconvert>=7.0
+nbformat>=5.0
