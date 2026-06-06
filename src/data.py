@@ -283,29 +283,23 @@ def build_detection_manifest(
     return written
 
 
-def _crop_plate(ann: PlateAnnotation, pad: int = 2):
-    """Read the image and return the (padded) plate crop, or ``None``."""
-    img = cv2.imread(str(ann.image_path))
-    if img is None:
-        return None
-    h, w = img.shape[:2]
-    x0 = max(0, ann.xmin - pad)
-    y0 = max(0, ann.ymin - pad)
-    x1 = min(w, ann.xmax + pad)
-    y1 = min(h, ann.ymax + pad)
-    if (x1 - x0) < MIN_CROP_SIDE or (y1 - y0) < MIN_CROP_SIDE:
-        return None
-    return img[y0:y1, x0:x1]
-
-
 def build_ocr_dataset(
     splits: dict[str, list[PlateAnnotation]], out_dir: str | Path
 ) -> Path:
-    """Crop, resize, grayscale plates into ``datasets/ocr/<split>/`` + labels.csv.
+    """Build the OCR crops into ``datasets/ocr/<split>/`` + labels.csv.
+
+    Crops go through the SAME preprocessing as the live pipeline
+    (:func:`src.preprocessing.preprocess_plate` — expand+crop, optional
+    perspective warp, grayscale, CLAHE) so the OCR trains on exactly the input
+    distribution it is served at inference time (no train/serve skew).
 
     Returns the path to ``labels.csv`` (columns: split, filename, plate_text).
     ``filename`` is relative to ``out_dir``.
     """
+    # Local import: preprocessing imports from this module, so importing it at
+    # module top level would be circular. By call time `data` is fully loaded.
+    from src.preprocessing import preprocess_plate
+
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     labels_path = out_dir / "labels.csv"
@@ -317,16 +311,11 @@ def build_ocr_dataset(
             split_dir = out_dir / split
             split_dir.mkdir(parents=True, exist_ok=True)
             for idx, ann in enumerate(anns):
-                crop = _crop_plate(ann)
-                if crop is None:
+                img = cv2.imread(str(ann.image_path))
+                if img is None:
                     continue
-                interp = (
-                    cv2.INTER_AREA
-                    if crop.shape[0] > OCR_HEIGHT or crop.shape[1] > OCR_WIDTH
-                    else cv2.INTER_CUBIC
-                )
-                resized = cv2.resize(crop, (OCR_WIDTH, OCR_HEIGHT), interpolation=interp)
-                gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+                # (H, W) uint8 grayscale — identical to inference preprocessing.
+                gray = preprocess_plate(img, (ann.xmin, ann.ymin, ann.xmax, ann.ymax))
                 # Unique filename: plate text + running index avoids collisions
                 # when the same plate appears across sources.
                 fname = f"{ann.plate_text}_{idx:05d}.png"
