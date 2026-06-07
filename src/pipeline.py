@@ -19,17 +19,9 @@ from src.preprocessing import preprocess_plate
 class ALPRPipeline:
     """Chains the detector, OpenCV preprocessing, and the CRNN reader."""
 
-    def __init__(
-        self,
-        detector_path: str | Path,
-        ocr_weights_path: str | Path,
-        char_map_path: str | Path | None = None,
-    ):
+    def __init__(self, detector_path: str | Path, ocr_weights_path: str | Path):
         self.detector = load_detector(detector_path)
         self.ocr_model = load_ocr_model(ocr_weights_path)
-        # char_map_path is accepted for API symmetry; the charset is fixed in
-        # src.ocr, so it is not strictly required at inference time.
-        self.char_map_path = char_map_path
 
     def run(self, image_path: str | Path) -> list[dict]:
         """Run the full pipeline on one image.

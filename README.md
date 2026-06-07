@@ -18,8 +18,8 @@ Three modular stages, chained end-to-end by `src/pipeline.py`:
     ▼
 ┌─────────────────────┐   1. Detection  (src/detection.py)
 │  MobileNetV2 +      │   Regresses one normalized box [xmin,ymin,xmax,ymax].
-│  bbox-regression    │   Loss = Huber + (1 − GIoU); metric = mean IoU.
-└─────────────────────┘
+│  bbox-regression    │   Loss = Huber + (1 − GIoU); metric = mean IoU. Trained
+└─────────────────────┘   in 3 phases: Huber warmup → +GIoU → backbone fine-tune.
     │  box
     ▼
 ┌─────────────────────┐   2. Preprocessing  (src/preprocessing.py)
@@ -92,29 +92,27 @@ pip install -r requirements.txt
 
 ## Usage
 
-### Notebook (report-style walkthrough)
+There are **two ways to run this project**:
 
-`alpr_pipeline.ipynb` runs the entire pipeline end-to-end with rich explanations,
-EDA, training curves, and sample-prediction visualizations — a self-contained
-alternative to the CLI below. It trains with small default epochs (or loads saved
-models if present), so it executes on CPU in minutes:
+1. **CLI scripts** — the end-to-end path (prepare → train → evaluate), for
+   reproducible runs and scripting.
+2. **`alpr_pipeline.ipynb`** — the explained, exploratory path: the same pipeline
+   as a report-style notebook with EDA, training curves, error analysis, and
+   sample-prediction visualizations.
 
-```bash
-pip install -r requirements-dev.txt   # adds jupyter/nbconvert
-jupyter notebook alpr_pipeline.ipynb
-```
-
-### CLI scripts
+### 1. CLI scripts (end-to-end)
 
 ```bash
 # 1. Build datasets from the raw VOC data (prints real counts + leakage check)
 python scripts/prepare_data.py
 
 # 2. Train the detector  → models/detection/detector.keras
-python scripts/train_detection.py        # --epochs 100 --batch-size 16
+#    3 phases: Huber warmup → Huber+GIoU → backbone fine-tune
+python scripts/train_detection.py    # --warmup-epochs 10 --finetune-epochs 120 \
+                                     # --backbone-ft-epochs 50 --batch-size 16
 
-# 3. Train the OCR model → models/ocr/crnn_best.keras (+ char_map.json)
-python scripts/train_ocr.py              # --epochs 50 --batch-size 32
+# 3. Train the OCR model → models/ocr/crnn_best.keras
+python scripts/train_ocr.py          # --epochs 40 --batch-size 32
 
 # 4. Evaluate any stage
 python scripts/evaluate.py --stage detection   # mean IoU + acc@IoU≥0.5
@@ -125,6 +123,20 @@ python scripts/evaluate.py --stage pipeline    # end-to-end exact-match + per-st
 `prepare_data.py` reads originals and writes:
 - `datasets/detection/{train,val,test}.csv` — normalized boxes + plate text
 - `datasets/ocr/{train,val,test}/*.png` + `datasets/ocr/labels.csv`
+
+### 2. Notebook (explained walkthrough)
+
+`alpr_pipeline.ipynb` runs the entire pipeline with rich explanations and the
+bottleneck analysis. It trains fresh or loads saved models if present, and runs on
+CPU in minutes at the default epoch counts (bump them + use a GPU for real results):
+
+```bash
+pip install -r requirements-dev.txt   # adds jupyter/nbconvert
+jupyter notebook alpr_pipeline.ipynb
+```
+
+The notebook inlines the model definitions and training for visibility; they
+mirror `src/`. Either path produces the same `models/*.keras` artifacts.
 
 ### Inference in code
 
@@ -174,13 +186,21 @@ output shape, and a CTC encode → decode round-trip.
 
 ---
 
-## Targets
+## Targets & representative results
+
+Aspirational targets:
 
 | Metric                          | Target   |
 |---------------------------------|----------|
 | Detection mean IoU / acc@0.5    | > ~0.85  |
 | OCR exact-match / CER           | > 80% / < 5% |
 | End-to-end full-plate accuracy  | reported per state |
+
+Representative numbers from a full GPU run (see `alpr_pipeline.ipynb` §7 for the
+full table and analysis): detector test mean IoU ≈ 0.41, OCR exact-match on
+ground-truth crops ≈ 0.46, end-to-end full-plate exact-match ≈ 0.23. The detector
+is the bottleneck — the single-box regressor plateaus around ~0.41 IoU, so a true
+object detector (e.g. YOLO) is the natural next step.
 
 ---
 

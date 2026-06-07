@@ -2,14 +2,14 @@
 
 A lightweight 4-block CNN reduces a (64, 256, 1) grayscale plate to a feature
 map whose width axis (T=32) is the sequence axis, which two BiLSTM layers and a
-softmax head turn into per-timestep character probabilities. Trained with the
-built-in ``keras.losses.CTC`` (Keras 3) and decoded greedily via
-``keras.ops.ctc_decode``.
+Dense layer turn into per-timestep character *logits* (not softmax —
+``keras.losses.CTC`` and ``keras.ops.ctc_decode`` apply softmax internally).
+Trained with the built-in ``keras.losses.CTC`` (Keras 3) and decoded greedily
+via ``keras.ops.ctc_decode``.
 """
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import keras
@@ -157,14 +157,49 @@ def make_dataset(
 
 # --- Training -------------------------------------------------------------
 
+class ValExactMatch(keras.callbacks.Callback):
+    """Log true decoded exact-match on the val set as ``val_exact_match``.
+
+    CTC ``val_loss`` is a poor proxy for readability: it bottoms out early while
+    the net still predicts a near-constant string (prior collapse), and only
+    later learns to read. Selecting on ``val_loss`` therefore restores the
+    collapsed weights (exact-match ~0). This callback decodes the val set each
+    epoch and injects the real exact-match so checkpoint / early-stopping can
+    select on it instead.
+    """
+
+    def __init__(self, val_ds: tf.data.Dataset):
+        super().__init__()
+        self.val_ds = val_ds
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs if logs is not None else {}
+        preds, truths = [], []
+        # Pair preds and truths in the same loop (per batch) — no ordering bug.
+        for images, labels in self.val_ds:
+            preds.extend(ctc_greedy_decode(self.model.predict(images, verbose=0)))
+            # Ground truth = inverse of encode_label: indices 1..36 -> chars,
+            # dropping the blank/pad index 0.
+            for row in labels.numpy():
+                truths.append("".join(IDX_TO_CHAR[int(i)] for i in row if int(i) > 0))
+        em = float(np.mean([p == t for p, t in zip(preds, truths)]))
+        logs["val_exact_match"] = em
+        print(f" — val_exact_match: {em:.4f}")
+
+
 def train(
     labels_csv: str | Path = "datasets/ocr/labels.csv",
     model_out: str | Path = "models/ocr/crnn_best.keras",
-    epochs: int = 50,
+    epochs: int = 40,
     batch_size: int = 32,
     lr: float = 1e-3,
 ) -> keras.Model:
-    """Train the CRNN with CTC loss; save best checkpoint and char_map.json."""
+    """Train the CRNN with CTC loss; checkpoint/early-stop on val exact-match.
+
+    Monitors ``val_exact_match`` (via :class:`ValExactMatch`) rather than
+    ``val_loss`` — see that callback for why. ``restore_best_weights`` returns the
+    highest-exact-match epoch's weights.
+    """
     model_out = Path(model_out)
     model_out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -173,24 +208,20 @@ def train(
 
     model = build_crnn()
     model.compile(optimizer=keras.optimizers.Adam(lr), loss=keras.losses.CTC())
+    # ValExactMatch must run first so it injects 'val_exact_match' into logs
+    # before ModelCheckpoint / EarlyStopping read it the same epoch.
     callbacks = [
+        ValExactMatch(val_ds),
         keras.callbacks.ModelCheckpoint(
-            str(model_out), save_best_only=True, monitor="val_loss"
+            str(model_out), save_best_only=True,
+            monitor="val_exact_match", mode="max",
         ),
-        keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=5),
         keras.callbacks.EarlyStopping(
-            monitor="val_loss", patience=10, restore_best_weights=True
+            monitor="val_exact_match", mode="max",
+            patience=20, restore_best_weights=True,
         ),
     ]
     model.fit(train_ds, validation_data=val_ds, epochs=epochs, callbacks=callbacks)
-
-    # Persist the character map alongside the weights.
-    char_map_path = model_out.parent / "char_map.json"
-    char_map_path.write_text(
-        json.dumps(
-            {"chars": CHARS, "blank_index": BLANK_INDEX, "num_classes": NUM_CLASSES}
-        )
-    )
     return model
 
 

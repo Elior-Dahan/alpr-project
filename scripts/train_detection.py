@@ -1,8 +1,10 @@
 #!/usr/bin/env python
-"""Train the MobileNetV2 plate detector (two-phase: Huber warmup -> Huber+GIoU).
+"""Train the MobileNetV2 plate detector.
+
+Three phases: Huber warmup -> Huber + GIoU -> backbone fine-tune.
 
 Usage:
-    python scripts/train_detection.py [--warmup-epochs 8] [--finetune-epochs 8]
+    python scripts/train_detection.py [--warmup-epochs 10] [--finetune-epochs 120]
 """
 
 from __future__ import annotations
@@ -14,10 +16,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.detection import (  # noqa: E402
+    BACKBONE_FT_EPOCHS,
+    BACKBONE_FT_LR,
     FINETUNE_EPOCHS,
     FINETUNE_LR,
     WARMUP_EPOCHS,
     WARMUP_LR,
+    WEIGHT_DECAY,
     train,
 )
 
@@ -31,6 +36,9 @@ def main() -> None:
     parser.add_argument("--warmup-lr", default=WARMUP_LR, type=float)
     parser.add_argument("--finetune-epochs", default=FINETUNE_EPOCHS, type=int)
     parser.add_argument("--finetune-lr", default=FINETUNE_LR, type=float)
+    parser.add_argument("--backbone-ft-epochs", default=BACKBONE_FT_EPOCHS, type=int)
+    parser.add_argument("--backbone-ft-lr", default=BACKBONE_FT_LR, type=float)
+    parser.add_argument("--weight-decay", default=WEIGHT_DECAY, type=float)
     args = parser.parse_args()
 
     train(
@@ -41,6 +49,9 @@ def main() -> None:
         warmup_lr=args.warmup_lr,
         finetune_epochs=args.finetune_epochs,
         finetune_lr=args.finetune_lr,
+        backbone_ft_epochs=args.backbone_ft_epochs,
+        backbone_ft_lr=args.backbone_ft_lr,
+        weight_decay=args.weight_decay,
     )
 
 

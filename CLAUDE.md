@@ -27,7 +27,12 @@ Three modular stages, orchestrated end-to-end by `src/pipeline.py::ALPRPipeline`
 
 1. **Detection** (`src/detection.py`) — MobileNetV2 → Dense(4, sigmoid) regresses one
    normalized `[xmin,ymin,xmax,ymax]` box. Loss = Huber + (1−GIoU); metric = mean IoU.
-   One plate per image, so a single box suffices.
+   One plate per image, so a single box suffices. **`train()` runs three phases**:
+   Huber warmup → Huber+GIoU → backbone fine-tune (top 10 layers, BatchNorm in
+   inference mode), all on AdamW. A *single* `ModelCheckpoint` is shared across the
+   phases so it tracks the global-best `val_mean_iou`; the best checkpoint is reloaded
+   and returned (not the weights Phase 3 ended on). The Huber warmup is required — a
+   cold GIoU start collapses the box (mean_iou stuck at 0).
 2. **Preprocessing** (`src/preprocessing.py`) — `preprocess_plate()`: expand+crop the box,
    recover plate corners (Canny→contours→approxPolyDP), 4-point perspective warp (falls back
    to plain resize), grayscale, CLAHE → `(64, 256)` uint8.
@@ -35,6 +40,9 @@ Three modular stages, orchestrated end-to-end by `src/pipeline.py::ALPRPipeline`
    2× BiLSTM → Dense logits `(B, 32, 37)`. Trained with built-in `keras.losses.CTC`;
    decoded with `keras.ops.ctc_decode`. **The Dense output is linear logits, not softmax**
    (CTC loss/decode apply softmax internally). Charset = 36 chars + blank at index 0.
+   **`train()` checkpoints/early-stops on `val_exact_match`** (the `ValExactMatch`
+   callback decodes the val set each epoch), *not* `val_loss` — CTC `val_loss` bottoms
+   out at the prior-collapse epoch and would restore unreadable weights.
 
 `src/data.py` is the shared data layer: `parse_voc` (filters noise via the two plate regexes,
 skips Zone.Identifier and degenerate boxes), `deduplicate` (video frames → one per plate, largest
@@ -54,12 +62,16 @@ python scripts/evaluate.py --stage pipeline    # end-to-end exact-match on predi
 pytest tests/                                  # offline unit tests (parse/preprocess/ctc)
 ```
 
-`alpr_pipeline.ipynb` (repo root) is a report-style notebook that runs the whole
-pipeline as an alternative to the CLI — hybrid style: it imports utilities from
-`src/` but inlines `build_detector`/`build_crnn` for visibility. It trains with
-small default epochs or loads saved models if present. Notebook tooling lives in
-`requirements-dev.txt` (`jupyter`/`nbconvert`). Generated `datasets/` and `models/`
-are git-ignored.
+There are **two ways to run the project**: the **CLI scripts** above (the
+end-to-end path: prepare → train → evaluate) and **`alpr_pipeline.ipynb`** (repo
+root), a report-style notebook that is the *explained, exploratory* path. The
+notebook is hybrid — it imports utilities from `src/` but inlines
+`build_detector`/`build_crnn` and the three-phase detector training / exact-match
+OCR training for visibility, so the inlined code mirrors `src/` rather than calling
+`detection.train`/`ocr.train`. It loads saved models if present, else trains. Keep
+the inlined notebook training in sync with `src/detection.py` and `src/ocr.py` when
+either changes. Notebook tooling lives in `requirements-dev.txt`
+(`jupyter`/`nbconvert`). Generated `datasets/` and `models/` are git-ignored.
 
 ## Data Structure
 

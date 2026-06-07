@@ -4,6 +4,9 @@ A MobileNetV2 backbone with a small regression head predicts a single
 normalized box ``[xmin, ymin, xmax, ymax]`` in [0, 1]. Trained with a
 Huber + (1 - GIoU) loss and a mean-IoU metric. One plate per image, so a
 single box is sufficient.
+
+Training runs in three phases (Huber warmup -> Huber + GIoU -> backbone
+fine-tune); see :func:`train` for the rationale.
 """
 
 from __future__ import annotations
@@ -189,25 +192,23 @@ def make_dataset(
 
 # --- Training -------------------------------------------------------------
 
-# Two-phase schedule. Adding GIoU from a cold start produces noisy gradients
+# Three-phase schedule. Adding GIoU from a cold start produces noisy gradients
 # while boxes don't yet overlap, which can saturate the output sigmoid into an
 # inverted box (xmax < xmin) where GIoU's clamps *and* Huber's saturated sigmoid
 # both kill the gradient — the model collapses (mean_iou stuck at 0). So we warm
-# up with Huber alone until boxes overlap, then fine-tune with Huber + GIoU at a
-# lower LR. Tune these knobs freely.
-WARMUP_EPOCHS = 8
+# up with Huber alone until boxes overlap (Phase 1), refine with Huber + GIoU
+# (Phase 2), then unfreeze the top of the backbone (Phase 3). Each epoch count
+# is a max budget — EarlyStopping on val mean IoU cuts each phase short. Tune
+# these knobs freely.
+WARMUP_EPOCHS = 10
 WARMUP_LR = 1e-4
-# Phase 2 is a max budget — EarlyStopping (patience 5 on val mean IoU) stops it
-# once IoU plateaus, so this is an upper bound rather than a fixed count.
-FINETUNE_EPOCHS = 50
+FINETUNE_EPOCHS = 120
 FINETUNE_LR = 3e-5
-
-
-def _checkpoint(model_out: Path) -> keras.callbacks.ModelCheckpoint:
-    """Save the best model by validation mean IoU (shared across both phases)."""
-    return keras.callbacks.ModelCheckpoint(
-        str(model_out), save_best_only=True, monitor="val_mean_iou", mode="max"
-    )
+BACKBONE_FT_EPOCHS = 50
+BACKBONE_FT_LR = 1e-5
+WEIGHT_DECAY = 1e-4  # AdamW decoupled weight decay (all phases)
+EARLY_STOPPING_PATIENCE = 15
+BACKBONE_FT_LAYERS = 10  # top-N backbone layers unfrozen in Phase 3
 
 
 def train(
@@ -218,12 +219,22 @@ def train(
     warmup_lr: float = WARMUP_LR,
     finetune_epochs: int = FINETUNE_EPOCHS,
     finetune_lr: float = FINETUNE_LR,
+    backbone_ft_epochs: int = BACKBONE_FT_EPOCHS,
+    backbone_ft_lr: float = BACKBONE_FT_LR,
+    weight_decay: float = WEIGHT_DECAY,
 ) -> keras.Model:
-    """Train the detector in two phases; save the best checkpoint by val mean IoU.
+    """Train the detector in three phases; return the global-best model.
 
     Phase 1 warms up with Huber only (stable box regression); Phase 2 re-compiles
-    the *same* model with the full Huber + GIoU loss to refine localisation. See
-    the module-level note for why the warmup is necessary.
+    the *same* model with the full Huber + GIoU loss to refine localisation;
+    Phase 3 unfreezes the top ``BACKBONE_FT_LAYERS`` backbone layers (BatchNorm
+    kept in inference mode) and fine-tunes at a very low LR. See the module-level
+    note for why the warmup is necessary.
+
+    A single ``ModelCheckpoint`` is shared across all three phases, so it tracks
+    the global-best ``val_mean_iou`` rather than resetting each phase; the saved
+    checkpoint is reloaded at the end so the returned model is that best — not the
+    weights Phase 3 happened to finish on. AdamW adds mild weight decay throughout.
 
     Raises ``RuntimeError`` if the warmup fails to produce a non-zero mean IoU
     within the first epoch — a sign the data/manifest is wrong, so we stop rather
@@ -241,16 +252,26 @@ def train(
 
     model = build_detector()
 
+    # One checkpoint shared across all phases, so it tracks the global-best
+    # val_mean_iou rather than resetting each phase.
+    ckpt = keras.callbacks.ModelCheckpoint(
+        str(model_out), save_best_only=True, monitor="val_mean_iou", mode="max"
+    )
+
+    def early() -> keras.callbacks.EarlyStopping:
+        return keras.callbacks.EarlyStopping(
+            monitor="val_mean_iou", mode="max",
+            patience=EARLY_STOPPING_PATIENCE, restore_best_weights=True,
+        )
+
+    def opt(lr: float) -> keras.optimizers.Optimizer:
+        return keras.optimizers.AdamW(learning_rate=lr, weight_decay=weight_decay)
+
     # Phase 1 — Huber warmup.
     print(f"[detector] Phase 1: Huber warmup — {warmup_epochs} epochs @ lr={warmup_lr}")
-    model.compile(
-        optimizer=keras.optimizers.Adam(warmup_lr),
-        loss=keras.losses.Huber(),
-        metrics=[MeanIoU()],
-    )
+    model.compile(optimizer=opt(warmup_lr), loss=keras.losses.Huber(), metrics=[MeanIoU()])
     hist = model.fit(
-        train_ds, validation_data=val_ds,
-        epochs=warmup_epochs, callbacks=[_checkpoint(model_out)],
+        train_ds, validation_data=val_ds, epochs=warmup_epochs, callbacks=[ckpt],
     )
 
     # Gate: stable regression should yield a non-zero IoU within one epoch.
@@ -261,31 +282,39 @@ def train(
             "Stopping before the GIoU phase — investigate the data/manifest."
         )
 
-    # Phase 2 — Huber + GIoU fine-tune. EarlyStopping (not a fixed count) ends
-    # this phase once val mean IoU plateaus, restoring the best weights.
+    # Phase 2 — Huber + GIoU fine-tune.
     print(
         f"[detector] Phase 2: Huber+GIoU fine-tune — up to {finetune_epochs} epochs @ lr={finetune_lr}"
     )
-    model.compile(
-        optimizer=keras.optimizers.Adam(finetune_lr),
-        loss=detector_loss,
-        metrics=[MeanIoU()],
-    )
+    model.compile(optimizer=opt(finetune_lr), loss=detector_loss, metrics=[MeanIoU()])
     model.fit(
-        train_ds,
-        validation_data=val_ds,
-        epochs=finetune_epochs,
-        callbacks=[
-            _checkpoint(model_out),
-            keras.callbacks.EarlyStopping(
-                monitor="val_mean_iou",
-                mode="max",
-                patience=5,
-                restore_best_weights=True,
-            ),
-        ],
+        train_ds, validation_data=val_ds,
+        epochs=finetune_epochs, callbacks=[ckpt, early()],
     )
-    return model
+
+    # Phase 3 — unfreeze the top backbone layers (BatchNorm stays in inference
+    # mode) and fine-tune at a very low LR to push past the frozen ceiling.
+    backbone = next(l for l in model.layers if isinstance(l, keras.Model))
+    backbone.trainable = True
+    for layer in backbone.layers[:-BACKBONE_FT_LAYERS]:
+        layer.trainable = False
+    for layer in backbone.layers:
+        if isinstance(layer, keras.layers.BatchNormalization):
+            layer.trainable = False
+    n_trainable = sum(l.trainable for l in backbone.layers)
+    print(
+        f"[detector] Phase 3: backbone fine-tune — up to {backbone_ft_epochs} epochs @ "
+        f"lr={backbone_ft_lr} ({n_trainable}/{len(backbone.layers)} backbone layers trainable)"
+    )
+    model.compile(optimizer=opt(backbone_ft_lr), loss=detector_loss, metrics=[MeanIoU()])
+    model.fit(
+        train_ds, validation_data=val_ds,
+        epochs=backbone_ft_epochs, callbacks=[ckpt, early()],
+    )
+
+    # The shared checkpoint holds the global-best across phases. Reload it so the
+    # returned model is that best, not the in-memory Phase 3 weights.
+    return load_detector(model_out)
 
 
 # --- Inference ------------------------------------------------------------

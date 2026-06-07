@@ -1,8 +1,8 @@
 #!/usr/bin/env python
-"""Train the CRNN OCR model.
+"""Train the CRNN OCR model (checkpoint/early-stop on val exact-match).
 
 Usage:
-    python scripts/train_ocr.py [--epochs 50] [--batch-size 32]
+    python scripts/train_ocr.py [--epochs 40] [--batch-size 32]
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train the CRNN OCR model.")
     parser.add_argument("--labels-csv", default="datasets/ocr/labels.csv", type=Path)
     parser.add_argument("--model-out", default="models/ocr/crnn_best.keras", type=Path)
-    parser.add_argument("--epochs", default=50, type=int)
+    parser.add_argument("--epochs", default=40, type=int)
     parser.add_argument("--batch-size", default=32, type=int)
     parser.add_argument("--lr", default=1e-3, type=float)
     args = parser.parse_args()
