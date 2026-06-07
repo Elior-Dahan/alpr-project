@@ -17,7 +17,7 @@ import tensorflow as tf
 from keras import layers
 from keras.applications.mobilenet_v2 import preprocess_input
 
-INPUT_SIZE = 224
+INPUT_SIZE = 384  # plates are tiny in full frames; higher res aids localization
 
 
 # --- Model ----------------------------------------------------------------
@@ -159,9 +159,14 @@ def _decode_and_resize(path, box, augment):
     img = tf.image.resize(img, (INPUT_SIZE, INPUT_SIZE))
     img = tf.cast(img, tf.float32)
     if augment:
+        # Photometric only — these leave the target box valid (no geometry).
+        # Done in [0, 1] because random_hue/saturation convert via HSV.
+        img = img / 255.0
         img = tf.image.random_brightness(img, 0.1)
-        img = tf.image.random_contrast(img, 0.9, 1.1)
-        img = tf.clip_by_value(img, 0.0, 255.0)
+        img = tf.image.random_contrast(img, 0.85, 1.15)
+        img = tf.image.random_hue(img, 0.05)
+        img = tf.image.random_saturation(img, 0.85, 1.15)
+        img = tf.clip_by_value(img, 0.0, 1.0) * 255.0
     # MobileNetV2 expects inputs scaled to [-1, 1], not [0, 255] or [0, 1].
     img = preprocess_input(img)
     return img, box
@@ -228,9 +233,9 @@ def train(
     model_out = Path(model_out)
     model_out.parent.mkdir(parents=True, exist_ok=True)
 
-    # Augmentation is intentionally off for now (added deliberately later).
+    # Photometric augmentation on (box-safe) to fight the train/val IoU gap.
     train_ds = make_dataset(
-        detection_dir / "train.csv", batch_size, augment=False, shuffle=True
+        detection_dir / "train.csv", batch_size, augment=True, shuffle=True
     )
     val_ds = make_dataset(detection_dir / "val.csv", batch_size)
 
