@@ -9,7 +9,6 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.data import OCR_HEIGHT, OCR_WIDTH
 from src.preprocessing import four_point_transform, order_corners, preprocess_plate
 
 
@@ -32,5 +31,5 @@ def test_preprocess_plate_output_shape():
     img = np.random.randint(0, 255, (300, 400, 3), dtype=np.uint8)
     bbox = (50, 60, 200, 120)
     out = preprocess_plate(img, bbox)
-    assert out.shape == (OCR_HEIGHT, OCR_WIDTH)
+    assert out.shape == (64, 256)
     assert out.dtype == np.uint8
