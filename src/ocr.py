@@ -299,6 +299,12 @@ def train(
         keras.callbacks.EarlyStopping(
             monitor="val_exact_match", mode="max",
             patience=20, restore_best_weights=True,
+            # CTC sits at val_exact_match == 0 for the whole prior-collapse phase
+            # (often 20-40 epochs, longer with a sticky seed). Without this the
+            # "no improvement" counter runs during that plateau and stops the run
+            # early, restoring the collapsed weights. Don't arm it until the net
+            # has had a chance to escape collapse.
+            start_from_epoch=45,
         ),
     ]
     model.fit(train_ds, validation_data=val_ds, epochs=epochs, callbacks=callbacks)
