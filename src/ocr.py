@@ -1,7 +1,7 @@
 """Stage 3 — plate text recognition (CRNN + CTC, Keras 3).
 
 A lightweight 4-block CNN reduces an (OCR_HEIGHT, OCR_WIDTH, 1) grayscale plate
-to a feature map whose width axis (T = OCR_WIDTH / 4) is the sequence axis, which
+to a feature map whose width axis (T = OCR_WIDTH / 8) is the sequence axis, which
 two BiLSTM layers and a Dense layer turn into per-timestep character *logits*
 (not softmax — ``keras.losses.CTC`` and ``keras.ops.ctc_decode`` apply softmax
 internally). The later conv blocks pool height only (asymmetric (2, 1) pooling)
@@ -32,11 +32,14 @@ IDX_TO_CHAR = {i + 1: c for i, c in enumerate(CHARS)}
 
 MAX_LABEL_LEN = 12  # longest Indian plate (e.g. MH20TC830C) fits comfortably
 
-# The CNN halves the width in the first two blocks only; the last two use
-# asymmetric (2, 1) pooling (height only), so width -> width / 4. Deriving
-# TIME_STEPS from OCR_WIDTH keeps the model in sync with the input size.
-WIDTH_REDUCTION = 4
-TIME_STEPS = OCR_WIDTH // WIDTH_REDUCTION  # 320 -> 80 (>> MAX_LABEL_LEN)
+# The CNN halves the width in the first three blocks; the last uses asymmetric
+# (2, 1) pooling (height only), so width -> width / 8. Deriving TIME_STEPS from
+# OCR_WIDTH keeps the model in sync with the input size. T must clear the longest
+# plate with margin, but too many steps deepens the CTC all-blank basin and the
+# net can't escape it in a sane epoch budget — 40 is the sweet spot (> the old 32,
+# still far above MAX_LABEL_LEN).
+WIDTH_REDUCTION = 8
+TIME_STEPS = OCR_WIDTH // WIDTH_REDUCTION  # 320 -> 40 (>> MAX_LABEL_LEN)
 
 
 def encode_label(text: str) -> list[int]:
@@ -64,13 +67,13 @@ def build_crnn() -> keras.Model:
     inputs = keras.Input(shape=(OCR_HEIGHT, OCR_WIDTH, 1), name="image")
 
     x = inputs
-    # Every block halves H; only the first two also halve W. The asymmetric
-    # (2, 1) pools in the last two blocks keep the width (time) axis long so CTC
-    # has enough steps for ~9-10 char plates (too few steps drives 4/A, 6/8, B/R
+    # Every block halves H; only the first three also halve W. The asymmetric
+    # (2, 1) pool in the last block keeps the width (time) axis longer so CTC has
+    # enough steps for ~9-10 char plates (too few steps drives 4/A, 6/8, B/R
     # confusions). With OCR_HEIGHT=96, OCR_WIDTH=320:
     #   H: 96 -> 48 -> 24 -> 12 -> 6   (/16)
-    #   W: 320 -> 160 -> 80 -> 80 -> 80 (/4, so TIME_STEPS = 80)
-    pool_sizes = [(2, 2), (2, 2), (2, 1), (2, 1)]
+    #   W: 320 -> 160 -> 80 -> 40 -> 40 (/8, so TIME_STEPS = 40)
+    pool_sizes = [(2, 2), (2, 2), (2, 2), (2, 1)]
     filters = [64, 128, 256, 256]
     for f, pool in zip(filters, pool_sizes):
         x = layers.Conv2D(f, 3, padding="same", use_bias=False)(x)
@@ -78,11 +81,11 @@ def build_crnn() -> keras.Model:
         x = layers.Activation("relu")(x)
         x = layers.MaxPooling2D(pool)(x)
 
-    # x: (B, H'=6, W'=80, C=256). Move width to the front so it becomes the time
+    # x: (B, H'=6, W'=40, C=256). Move width to the front so it becomes the time
     # axis, then fold the remaining height and channels into one feature vector
-    # per timestep: (B, 80, 6*256=1536).
-    x = layers.Permute((2, 1, 3))(x)  # (B, 80, 6, 256)
-    x = layers.Reshape((TIME_STEPS, -1))(x)  # (B, 80, 1536)
+    # per timestep: (B, 40, 6*256=1536).
+    x = layers.Permute((2, 1, 3))(x)  # (B, 40, 6, 256)
+    x = layers.Reshape((TIME_STEPS, -1))(x)  # (B, 40, 1536)
 
     x = layers.Dropout(0.25)(x)
     x = layers.Bidirectional(layers.LSTM(256, return_sequences=True))(x)
