@@ -1,11 +1,13 @@
 """Stage 3 — plate text recognition (CRNN + CTC, Keras 3).
 
-A lightweight 4-block CNN reduces a (64, 256, 1) grayscale plate to a feature
-map whose width axis (T=32) is the sequence axis, which two BiLSTM layers and a
-Dense layer turn into per-timestep character *logits* (not softmax —
-``keras.losses.CTC`` and ``keras.ops.ctc_decode`` apply softmax internally).
-Trained with the built-in ``keras.losses.CTC`` (Keras 3) and decoded greedily
-via ``keras.ops.ctc_decode``.
+A lightweight 4-block CNN reduces an (OCR_HEIGHT, OCR_WIDTH, 1) grayscale plate
+to a feature map whose width axis (T = OCR_WIDTH / 4) is the sequence axis, which
+two BiLSTM layers and a Dense layer turn into per-timestep character *logits*
+(not softmax — ``keras.losses.CTC`` and ``keras.ops.ctc_decode`` apply softmax
+internally). The later conv blocks pool height only (asymmetric (2, 1) pooling)
+so the width/time axis stays long enough for CTC alignment. Trained with the
+built-in ``keras.losses.CTC`` (Keras 3) and decoded greedily via
+``keras.ops.ctc_decode``.
 """
 
 from __future__ import annotations
@@ -29,7 +31,12 @@ CHAR_TO_IDX = {c: i + 1 for i, c in enumerate(CHARS)}
 IDX_TO_CHAR = {i + 1: c for i, c in enumerate(CHARS)}
 
 MAX_LABEL_LEN = 12  # longest Indian plate (e.g. MH20TC830C) fits comfortably
-TIME_STEPS = 32  # CNN reduces width 256 -> 32 (>= 2 * max label length)
+
+# The CNN halves the width in the first two blocks only; the last two use
+# asymmetric (2, 1) pooling (height only), so width -> width / 4. Deriving
+# TIME_STEPS from OCR_WIDTH keeps the model in sync with the input size.
+WIDTH_REDUCTION = 4
+TIME_STEPS = OCR_WIDTH // WIDTH_REDUCTION  # 320 -> 80 (>> MAX_LABEL_LEN)
 
 
 def encode_label(text: str) -> list[int]:
@@ -57,11 +64,13 @@ def build_crnn() -> keras.Model:
     inputs = keras.Input(shape=(OCR_HEIGHT, OCR_WIDTH, 1), name="image")
 
     x = inputs
-    # Each block halves H; only the first three also halve W. The asymmetric
-    # last pool keeps the width (time) axis long enough for CTC:
-    #   H: 64 -> 32 -> 16 -> 8 -> 4    (/16)
-    #   W: 256 -> 128 -> 64 -> 32 -> 32 (/8, so TIME_STEPS = 32)
-    pool_sizes = [(2, 2), (2, 2), (2, 2), (2, 1)]
+    # Every block halves H; only the first two also halve W. The asymmetric
+    # (2, 1) pools in the last two blocks keep the width (time) axis long so CTC
+    # has enough steps for ~9-10 char plates (too few steps drives 4/A, 6/8, B/R
+    # confusions). With OCR_HEIGHT=96, OCR_WIDTH=320:
+    #   H: 96 -> 48 -> 24 -> 12 -> 6   (/16)
+    #   W: 320 -> 160 -> 80 -> 80 -> 80 (/4, so TIME_STEPS = 80)
+    pool_sizes = [(2, 2), (2, 2), (2, 1), (2, 1)]
     filters = [64, 128, 256, 256]
     for f, pool in zip(filters, pool_sizes):
         x = layers.Conv2D(f, 3, padding="same", use_bias=False)(x)
@@ -69,11 +78,11 @@ def build_crnn() -> keras.Model:
         x = layers.Activation("relu")(x)
         x = layers.MaxPooling2D(pool)(x)
 
-    # x: (B, H'=4, W'=32, C=256). Move width to the front so it becomes the time
+    # x: (B, H'=6, W'=80, C=256). Move width to the front so it becomes the time
     # axis, then fold the remaining height and channels into one feature vector
-    # per timestep: (B, 32, 4*256=1024).
-    x = layers.Permute((2, 1, 3))(x)  # (B, 32, 4, 256)
-    x = layers.Reshape((TIME_STEPS, -1))(x)  # (B, 32, 1024)
+    # per timestep: (B, 80, 6*256=1536).
+    x = layers.Permute((2, 1, 3))(x)  # (B, 80, 6, 256)
+    x = layers.Reshape((TIME_STEPS, -1))(x)  # (B, 80, 1536)
 
     x = layers.Dropout(0.25)(x)
     x = layers.Bidirectional(layers.LSTM(256, return_sequences=True))(x)
@@ -124,15 +133,83 @@ def _read_labels_csv(labels_csv: str | Path, split: str):
     return paths, np.asarray(labels, dtype=np.int32)
 
 
+def _maybe(prob, fn, img):
+    """Apply ``fn`` to ``img`` with probability ``prob`` (graph-safe)."""
+    return tf.cond(tf.random.uniform([]) < prob, lambda: fn(img), lambda: img)
+
+
+def _random_blur(img):
+    """Light 3x3 Gaussian blur — mimics soft / out-of-focus OLX thumbnails."""
+    kernel = tf.constant([[1.0, 2.0, 1.0], [2.0, 4.0, 2.0], [1.0, 2.0, 1.0]]) / 16.0
+    kernel = kernel[:, :, None, None]  # (3, 3, 1, 1) depthwise
+    blurred = tf.nn.depthwise_conv2d(img[None], kernel, [1, 1, 1, 1], "SAME")
+    return blurred[0]
+
+
+def _random_stroke(img):
+    """Minor stroke-width variation via 1-step erosion or dilation (3x3).
+
+    Plate glyphs are dark on a light background, so a max filter thins the
+    strokes (erosion) and a min filter thickens them (dilation). This perturbs
+    the exact shape that drives similar-character confusions (B/R, 8/B).
+    """
+    erode = tf.nn.max_pool2d(img[None], 3, 1, "SAME")[0]
+    dilate = -tf.nn.max_pool2d(-img[None], 3, 1, "SAME")[0]
+    return tf.cond(tf.random.uniform([]) < 0.5, lambda: erode, lambda: dilate)
+
+
+def _random_affine(img):
+    """Slight rotation + shear about the image center (mild, text-preserving)."""
+    h = tf.cast(tf.shape(img)[0], tf.float32)
+    w = tf.cast(tf.shape(img)[1], tf.float32)
+    cx, cy = w / 2.0, h / 2.0
+    angle = tf.random.uniform([], -0.05, 0.05)  # ~ ±3 degrees
+    shx = tf.random.uniform([], -0.05, 0.05)
+    shy = tf.random.uniform([], -0.05, 0.05)
+    cos, sin = tf.cos(angle), tf.sin(angle)
+    a0, a1 = cos, -sin + shx
+    b0, b1 = sin + shy, cos
+    # Translation terms keep the center fixed: t = c - M @ c.
+    a2 = cx - (a0 * cx + a1 * cy)
+    b2 = cy - (b0 * cx + b1 * cy)
+    transform = tf.stack([a0, a1, a2, b0, b1, b2, 0.0, 0.0])[None]  # (1, 8)
+    warped = tf.raw_ops.ImageProjectiveTransformV3(
+        images=img[None],
+        transforms=transform,
+        output_shape=tf.shape(img)[:2],
+        fill_value=1.0,  # white — matches the light plate background
+        interpolation="BILINEAR",
+        fill_mode="CONSTANT",
+    )
+    return warped[0]
+
+
+def _augment_image(img):
+    """Mild, character-safe OCR augmentation (each step applied probabilistically).
+
+    Targets the similar-shape confusions seen in error analysis (4/A, 6/8, B/R)
+    by jittering focus, sensor noise, geometry, and stroke width — never a flip
+    (mirrors text) or a distortion strong enough to change a glyph's identity.
+    """
+    # Photometric (lighting / contrast).
+    img = tf.image.random_brightness(img, 0.1)
+    img = tf.image.random_contrast(img, 0.9, 1.1)
+    # Focus, geometry, stroke width.
+    img = _maybe(0.3, _random_blur, img)
+    img = _maybe(0.5, _random_affine, img)
+    img = _maybe(0.3, _random_stroke, img)
+    # Light sensor noise.
+    img = img + tf.random.normal(tf.shape(img), stddev=0.02)
+    return tf.clip_by_value(img, 0.0, 1.0)
+
+
 def _decode_gray(path, label, augment):
     raw = tf.io.read_file(path)
     img = tf.io.decode_png(raw, channels=1)
     img = tf.image.resize(img, (OCR_HEIGHT, OCR_WIDTH))
     img = tf.cast(img, tf.float32) / 255.0
     if augment:
-        img = tf.image.random_brightness(img, 0.1)
-        img = tf.image.random_contrast(img, 0.9, 1.1)
-        img = tf.clip_by_value(img, 0.0, 1.0)
+        img = _augment_image(img)
     return img, label
 
 
@@ -143,7 +220,7 @@ def make_dataset(
     augment: bool = False,
     shuffle: bool = False,
 ) -> tf.data.Dataset:
-    """tf.data pipeline yielding ((B, 64, 256, 1) images, (B, MAX_LABEL_LEN) labels)."""
+    """tf.data pipeline yielding ((B, OCR_HEIGHT, OCR_WIDTH, 1) images, (B, MAX_LABEL_LEN) labels)."""
     paths, labels = _read_labels_csv(labels_csv, split)
     ds = tf.data.Dataset.from_tensor_slices((paths, labels))
     if shuffle:

@@ -3,7 +3,7 @@
 Bridges detection and OCR. The detector emits an axis-aligned box; this module
 expands and crops it, attempts to recover the plate's true four corners for a
 perspective rectification, then normalizes contrast so the OCR model sees a
-consistent (64, 256) grayscale image.
+consistent (OCR_HEIGHT, OCR_WIDTH) grayscale image.
 """
 
 from __future__ import annotations

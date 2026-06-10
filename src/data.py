@@ -5,7 +5,7 @@ performs a plate-aware train/val/test split, and builds the per-stage
 datasets:
 
   * detection -> a CSV manifest of normalized boxes (no image copying)
-  * ocr       -> cropped grayscale plates (64x256) + labels.csv
+  * ocr       -> cropped grayscale plates (OCR_HEIGHT x OCR_WIDTH) + labels.csv
 
 All count estimates in the plan (~1,591 clean, video 654->137, ~880 train)
 are confirmed at run time against the real data by ``scripts/prepare_data.py``.
@@ -34,9 +34,12 @@ EXTENDED_PLATE_RE = re.compile(r"^[A-Z]{2}\d{2}[A-Z]{2,3}\d{1,4}[A-Z]?$")
 # Image extensions we accept (case-insensitive).
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 
-# Crop geometry shared between OCR dataset building and preprocessing.
-OCR_HEIGHT = 64
-OCR_WIDTH = 256
+# Crop geometry shared between OCR dataset building, preprocessing, and the CRNN
+# input shape (everything downstream reads these — never hard-code the size).
+# Larger than the original 64x256 to use more of the detail in the 384px detector
+# crops; the width is the OCR sequence axis, so it is kept generous.
+OCR_HEIGHT = 96
+OCR_WIDTH = 320
 MIN_CROP_SIDE = 10
 MIN_BOX_SIDE = 5
 

@@ -1,6 +1,6 @@
 """End-to-end ALPR inference: detect -> preprocess -> read.
 
-    image -> detect_plate (box) -> preprocess_plate (64x256 gray)
+    image -> detect_plate (box) -> preprocess_plate (OCR_HEIGHT x OCR_WIDTH gray)
           -> CRNN -> ctc_greedy_decode -> plate text
 """
 
@@ -34,9 +34,9 @@ class ALPRPipeline:
             raise FileNotFoundError(f"could not read image: {image_path}")
 
         bbox = detect_plate(img, self.detector)
-        crop = preprocess_plate(img, bbox)  # (64, 256) uint8
+        crop = preprocess_plate(img, bbox)  # (OCR_HEIGHT, OCR_WIDTH) uint8
 
-        batch = (crop.astype(np.float32) / 255.0)[None, ..., None]  # (1,64,256,1)
+        batch = (crop.astype(np.float32) / 255.0)[None, ..., None]  # (1,H,W,1)
         probs = self.ocr_model.predict(batch, verbose=0)
         plate_text = ctc_greedy_decode(probs)[0]
 
